@@ -405,17 +405,27 @@ def firmware_zip_url(device: str, version: str, src: str = DEFAULT_SRC) -> str:
 
 
 def make_fid(device: str, version: str, src: str) -> str:
-    return f"{device}|{version}|{src}"
+    # URL-encode src to avoid spaces and other special characters that break
+    # HTTP request lines when the Launcher firmware sends fid unencoded.
+    # e.g. "Official repo" → "Official%20repo" so the fid contains no spaces.
+    return f"{device}|{version}|{quote(src, safe='')}"
 
 
 def parse_fid(fid: str) -> tuple[str, str, str]:
     """Parse fid into (device, version, src). src defaults to DEFAULT_SRC."""
+    from urllib.parse import unquote
     parts = fid.split("|", 2)
     if len(parts) < 2:
         raise ValueError(f"Invalid fid format: {fid!r}")
     device  = parts[0]
     version = parts[1]
-    src     = parts[2] if len(parts) > 2 else DEFAULT_SRC
+    src_raw = parts[2] if len(parts) > 2 else DEFAULT_SRC
+    # Decode percent-encoded src (e.g. "Official%20repo" → "Official repo").
+    src = unquote(src_raw)
+    # Backward-compat: old fids may have a literal space that was truncated by
+    # the Launcher's HTTP client (e.g. "Official" instead of "Official repo").
+    if src != DEFAULT_SRC and DEFAULT_SRC.startswith(src + " "):
+        src = DEFAULT_SRC
     return device, version, src
 
 
