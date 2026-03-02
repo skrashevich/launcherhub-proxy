@@ -1,0 +1,510 @@
+"""
+LauncherHub-compatible API proxy for mrekin.duckdns.org flasher.
+
+Aggregates firmware from all available repositories and automatically finds
+related device variants using family-based name matching.
+
+Family matching algorithm:
+  1. Find the "family root" – the longest dash-separated prefix of the
+     requested device name that is a known firmware device.
+     E.g. "t-deck-plus" → root "t-deck"  (if "t-deck-plus" is unknown but "t-deck" is)
+  2. Collect all known devices sharing that root as a prefix.
+     E.g. "t-deck" → {t-deck, t-deck-tft, t-deck-tft-ru, t-deck-plus, t-deck-ru, …}
+
+Endpoints:
+  GET /firmwares?category=<OTA_TAG>[&order_by=...][&page=N][&q=...][&star=1]
+  GET /firmwares?fid=<fid>
+  GET /download?fid=<fid>&file=<url>
+
+fid format: "<device>|<version>|<src>"
+  - src is optional for backwards compatibility (defaults to "Official repo")
+  - e.g. "t-deck|v2.7.18.fb3bf78|Official repo"
+  - e.g. "t-deck-tft|v2.7.19.bb3d6d5|svk"
+
+Run:
+  pip install fastapi uvicorn httpx
+  uvicorn main:app --host 0.0.0.0 --port 8000
+
+For HTTPS (required by the firmware, which uses WiFiClientSecure):
+  uvicorn main:app --host 0.0.0.0 --port 443 \
+      --ssl-keyfile key.pem --ssl-certfile cert.pem
+"""
+
+import asyncio
+import struct
+import logging
+from typing import Optional
+from urllib.parse import quote
+
+import httpx
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import StreamingResponse
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+UPSTREAM_BASE = "https://mrekin.duckdns.org/flasher/api"
+DEFAULT_SRC   = "Official repo"
+
+# How many firmware entries per page
+PAGE_SIZE = 10
+
+# Partition table sits at 0x8000 in the flash image; we read 0x1A0 bytes (13 entries × 32 bytes)
+PARTITION_TABLE_OFFSET = 0x8000
+PARTITION_TABLE_SIZE   = 0x1B0   # a bit extra, safe margin
+
+log = logging.getLogger("launcherhub")
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI(title="LauncherHub-compatible proxy")
+
+# In-memory caches
+_sources_cache: list[dict] | None = None
+_all_devices_cache: set[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Partition-table parser (mirrors the C++ logic in installExtFirmware)
+# ---------------------------------------------------------------------------
+
+def parse_partition_table(data: bytes) -> dict:
+    """
+    Parse an ESP32 partition table blob (read from offset 0x8000 of the .bin).
+    Returns a dict with the fields expected by the Launcher firmware JSON.
+    """
+    result = {
+        "nb": True,          # no-bootloader flag: True  → file is app-only (no PT)
+        "s":  False,         # has SPIFFS/LittleFS
+        "f":  False,         # has FAT partition 1
+        "f2": False,         # has FAT partition 2
+        "ao": 0x10000,       # app offset  (default)
+        "as": 0,             # app size
+        "so": 0,             # spiffs offset
+        "ss": 0,             # spiffs size
+        "fo": 0,             # fat1 offset
+        "fs": 0,             # fat1 size
+        "fo2": 0,            # fat2 offset
+        "fs2": 0,            # fat2 size
+    }
+
+    # First byte of a valid partition table magic is 0xAA
+    if not data or data[0] != 0xAA:
+        log.info("No valid partition table found (first byte = 0x%02x) – treating as nb=True", data[0] if data else 0xFF)
+        return result
+
+    result["nb"] = False
+    fat_count = 0
+
+    for i in range(0, min(len(data), 0x1A0 + 0x20), 0x20):
+        entry = data[i:i + 0x20]
+        if len(entry) < 16:
+            break
+        # Partition magic
+        if entry[0] != 0xAA or entry[1] != 0x50:
+            continue
+
+        ptype    = entry[2]
+        subtype  = entry[3]
+
+        # Offset is stored little-endian in bytes 4-7 (32-bit)
+        offset = struct.unpack_from("<I", entry, 4)[0]
+        # Size   is stored little-endian in bytes 8-11
+        size   = struct.unpack_from("<I", entry, 8)[0]
+
+        # App / OTA (type=0x00, subtype 0x00..0x1F)
+        if ptype == 0x00 and (subtype == 0x00 or 0x10 <= subtype <= 0x1F):
+            if result["as"] == 0:          # first app partition wins
+                result["ao"] = offset
+                result["as"] = size
+            log.info("  APP  partition: offset=0x%x size=0x%x", offset, size)
+
+        # SPIFFS / LittleFS (type=0x01, subtype=0x82 or 0x83)
+        elif ptype == 0x01 and subtype in (0x82, 0x83):
+            result["s"]  = True
+            result["so"] = offset
+            result["ss"] = size
+            log.info("  SPIFFS partition: offset=0x%x size=0x%x", offset, size)
+
+        # FAT (type=0x01, subtype=0x81)
+        elif ptype == 0x01 and subtype == 0x81:
+            if fat_count == 0:
+                result["f"]  = True
+                result["fo"] = offset
+                result["fs"] = size
+                log.info("  FAT1 partition: offset=0x%x size=0x%x", offset, size)
+            elif fat_count == 1:
+                result["f2"]  = True
+                result["fo2"] = offset
+                result["fs2"] = size
+                log.info("  FAT2 partition: offset=0x%x size=0x%x", offset, size)
+            fat_count += 1
+
+    return result
+
+
+async def fetch_partition_info(fw_url: str) -> dict:
+    """
+    Download only the partition-table region of the firmware binary (HTTP Range request)
+    and parse it.  Falls back to nb=True defaults on any error.
+    """
+    byte_start = PARTITION_TABLE_OFFSET
+    byte_end   = PARTITION_TABLE_OFFSET + PARTITION_TABLE_SIZE - 1
+    headers    = {"Range": f"bytes={byte_start}-{byte_end}"}
+
+    try:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
+            r = await client.get(fw_url, headers=headers)
+            if r.status_code not in (200, 206):
+                log.warning("Range request returned %d for %s", r.status_code, fw_url)
+                return parse_partition_table(b"")
+            log.info("Fetched %d bytes of partition table from %s", len(r.content), fw_url)
+            return parse_partition_table(r.content)
+    except Exception as exc:
+        log.warning("Failed to fetch partition table from %s: %s", fw_url, exc)
+        return parse_partition_table(b"")
+
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+async def get_all_sources() -> list[dict]:
+    """Fetch available firmware sources from upstream (cached in memory)."""
+    global _sources_cache
+    if _sources_cache is None:
+        try:
+            async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
+                r = await client.get(f"{UPSTREAM_BASE}/srcs")
+                r.raise_for_status()
+                _sources_cache = r.json()
+                log.info("Loaded %d firmware sources: %s", len(_sources_cache),
+                         [s["src"] for s in _sources_cache])
+        except Exception as exc:
+            log.warning("Failed to fetch sources list: %s – falling back to default", exc)
+            _sources_cache = [{"src": DEFAULT_SRC, "desc": "Official Meshtastic firmware", "type": "meshtastic"}]
+    return _sources_cache
+
+
+async def get_all_devices() -> set[str]:
+    """Fetch all known device names across all sources (cached in memory)."""
+    global _all_devices_cache
+    if _all_devices_cache is None:
+        try:
+            async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
+                r = await client.get(f"{UPSTREAM_BASE}/availableFirmwares")
+                r.raise_for_status()
+                data = r.json()
+            devices: set[str] = set()
+            for key in ("espdevices", "uf2devices", "rp2040devices"):
+                devices.update(data.get(key, []))
+            _all_devices_cache = devices
+            log.info("Loaded %d known device names", len(devices))
+        except Exception as exc:
+            log.warning("Failed to fetch device list: %s", exc)
+            _all_devices_cache = set()
+    return _all_devices_cache
+
+
+# ---------------------------------------------------------------------------
+# Device family matching
+# ---------------------------------------------------------------------------
+
+def _find_family_root(category: str, all_devices: set[str]) -> str:
+    """
+    Find the longest dash-separated prefix of `category` that is a known device name.
+
+    Examples (given all_devices contains "t-deck" but not "t-deck-plus"):
+      "t-deck"      → "t-deck"   (exact match)
+      "t-deck-plus" → "t-deck"   (longest known prefix)
+      "unknown-xyz" → "unknown-xyz" (no match – returned as-is)
+    """
+    if category in all_devices:
+        return category
+    parts = category.split("-")
+    for n in range(len(parts) - 1, 0, -1):
+        prefix = "-".join(parts[:n])
+        if prefix in all_devices:
+            return prefix
+    return category
+
+
+def find_related_devices(category: str, all_devices: set[str]) -> list[str]:
+    """
+    Return all firmware device names that belong to the same family as `category`.
+
+    The family is anchored at the family root and includes every known device
+    whose name starts with "<root>-" or "<root>_".
+
+    The requested `category` is always first in the result (even if unknown),
+    followed by family members in alphabetical order.
+    """
+    root = _find_family_root(category, all_devices)
+    related: set[str] = {category}
+    for device in all_devices:
+        if device == root or device.startswith(root + "-") or device.startswith(root + "_"):
+            related.add(device)
+    return [category] + sorted(d for d in related if d != category)
+
+
+# ---------------------------------------------------------------------------
+# Upstream helpers
+# ---------------------------------------------------------------------------
+
+async def upstream_versions(device: str, src: str = DEFAULT_SRC) -> dict:
+    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
+        r = await client.get(f"{UPSTREAM_BASE}/versions", params={"t": device, "src": src})
+        r.raise_for_status()
+        return r.json()
+
+
+def firmware_url(device: str, version: str, src: str = DEFAULT_SRC) -> str:
+    return (
+        f"{UPSTREAM_BASE}/firmware"
+        f"?t={device}&v={version}&u=5&p=fw&e=true&src={quote(src)}"
+    )
+
+
+def make_fid(device: str, version: str, src: str) -> str:
+    return f"{device}|{version}|{src}"
+
+
+def parse_fid(fid: str) -> tuple[str, str, str]:
+    """Parse fid into (device, version, src). src defaults to DEFAULT_SRC."""
+    parts = fid.split("|", 2)
+    if len(parts) < 2:
+        raise ValueError(f"Invalid fid format: {fid!r}")
+    device  = parts[0]
+    version = parts[1]
+    src     = parts[2] if len(parts) > 2 else DEFAULT_SRC
+    return device, version, src
+
+
+# ---------------------------------------------------------------------------
+# Multi-source version fetching
+# ---------------------------------------------------------------------------
+
+async def _fetch_all_versions(
+    device_variants: list[str],
+    sources: list[dict],
+) -> list[tuple[str, str, dict]]:
+    """
+    Fetch versions for all (device, source) combinations concurrently.
+    Returns list of (device, src, versions_data) for combinations that have results.
+    """
+    combinations = [
+        (device, source["src"])
+        for device in device_variants
+        for source in sources
+    ]
+
+    async def fetch_one(device: str, src: str):
+        try:
+            data = await upstream_versions(device, src)
+            return (device, src, data)
+        except Exception as exc:
+            log.debug("No versions for %s from %s: %s", device, src, exc)
+            return None
+
+    results = await asyncio.gather(*[fetch_one(d, s) for d, s in combinations])
+    return [
+        r for r in results
+        if r is not None and r[2].get("versions")
+    ]
+
+
+# ---------------------------------------------------------------------------
+# /firmwares
+# ---------------------------------------------------------------------------
+
+@app.get("/firmwares")
+async def get_firmwares(
+    category:  Optional[str] = Query(None),
+    fid:       Optional[str] = Query(None),
+    order_by:  str           = Query("downloads"),
+    page:      int           = Query(1, ge=1),
+    q:         Optional[str] = Query(None),
+    star:      Optional[int] = Query(None),
+):
+    # ---- Mode 1: detail for a single firmware ----
+    if fid:
+        return await _get_version_detail(fid)
+
+    # ---- Mode 2: firmware list ----
+    if not category:
+        raise HTTPException(status_code=400, detail="'category' query param is required")
+
+    # Determine which device variants to query via automatic family matching
+    all_devices, sources = await asyncio.gather(get_all_devices(), get_all_sources())
+    device_variants = find_related_devices(category, all_devices)
+    log.info("Family for %r: %s", category, device_variants)
+    all_results = await _fetch_all_versions(device_variants, sources)
+
+    # Build unified firmware item list
+    items: list[dict] = []
+    for device, src, data in all_results:
+        versions_list: list[str] = data.get("versions", [])
+        dates: dict = data.get("dates", {})
+
+        for v in versions_list:
+            # Display name: include device name and source
+            name = f"{device} {v} [{src}]"
+            items.append({
+                "fid":    make_fid(device, v, src),
+                "name":   name,
+                "author": src,
+                "star":   False,
+                "_date":  dates.get(v, ""),
+            })
+
+    # --- Sorting ---
+    if order_by == "name":
+        items.sort(key=lambda x: x["name"])
+    else:
+        # Default ("downloads") and "date" both sort newest-first
+        items.sort(key=lambda x: x["_date"], reverse=True)
+
+    # --- Text search ---
+    if q:
+        ql = q.lower()
+        items = [i for i in items if ql in i["name"].lower() or ql in i["author"].lower()]
+
+    # --- Starred filter ---
+    if star == 1:
+        items = [i for i in items if i["star"]]
+
+    # --- Pagination ---
+    total = len(items)
+    start = (page - 1) * PAGE_SIZE
+    page_items = items[start: start + PAGE_SIZE]
+
+    result_items = [
+        {"fid": i["fid"], "name": i["name"], "author": i["author"], "star": i["star"]}
+        for i in page_items
+    ]
+
+    return {
+        "total":     total,
+        "page_size": PAGE_SIZE,
+        "page":      page,
+        "items":     result_items,
+    }
+
+
+async def _get_version_detail(fid: str) -> dict:
+    """
+    fid format: "<device>|<version>|<src>"
+    (src is optional for backwards compatibility – defaults to DEFAULT_SRC)
+
+    Returns the full firmware object with `versions` array expected by loopVersions().
+    """
+    if "|" not in fid:
+        raise HTTPException(
+            status_code=400,
+            detail="fid must be in format 'device|version[|src]', e.g. 't-deck|v2.7.18.fb3bf78|Official repo'"
+        )
+
+    try:
+        device, version, src = parse_fid(fid)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        upstream = await upstream_versions(device, src)
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+
+    dates = upstream.get("dates", {})
+    all_versions: list[str] = upstream.get("versions", [])
+
+    if version not in all_versions:
+        raise HTTPException(status_code=404, detail=f"Version '{version}' not found for device '{device}' in source '{src}'")
+
+    fw_url = firmware_url(device, version, src)
+    log.info("Fetching partition info for %s %s [%s] from %s", device, version, src, fw_url)
+    pt = await fetch_partition_info(fw_url)
+
+    version_obj = {
+        "version":      version,
+        "published_at": dates.get(version, ""),
+        "file":         fw_url,
+        # Partition fields
+        "nb": pt["nb"],
+        "s":  pt["s"],
+        "f":  pt["f"],
+        "f2": pt["f2"],
+        "as": pt["as"],
+        "ao": pt["ao"],
+        "ss": pt["ss"],
+        "so": pt["so"],
+        "fs": pt["fs"],
+        "fo": pt["fo"],
+        "fs2": pt["fs2"],
+        "fo2": pt["fo2"],
+    }
+
+    return {
+        "fid":    fid,
+        "name":   f"{device} {version} [{src}]",
+        "author": src,
+        "star":   False,
+        "versions": [version_obj],
+    }
+
+
+# ---------------------------------------------------------------------------
+# /download  – proxy / redirect to the actual binary
+# ---------------------------------------------------------------------------
+
+@app.get("/download")
+async def download_firmware(
+    fid:  Optional[str] = Query(None),
+    file: Optional[str] = Query(None),
+):
+    """
+    The Launcher firmware calls:
+        https://<host>/download?fid=<device>|<version>|<src>&file=<fw_url>
+
+    We just stream the binary from upstream (following redirects).
+    'file' already contains the full upstream URL built by _get_version_detail,
+    so we proxy it transparently.
+    """
+    target_url = file
+
+    # Fallback: reconstruct URL from fid if file param is missing
+    if not target_url and fid and "|" in fid:
+        try:
+            device, version, src = parse_fid(fid)
+            target_url = firmware_url(device, version, src)
+        except ValueError:
+            pass
+
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Provide 'file' or a valid 'fid' parameter")
+
+    log.info("Proxying firmware download: %s", target_url)
+
+    async def stream_upstream():
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=120) as client:
+            async with client.stream("GET", target_url) as r:
+                r.raise_for_status()
+                async for chunk in r.aiter_bytes(chunk_size=8192):
+                    yield chunk
+
+    # Try to get Content-Length for progress display on the device
+    try:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
+            head = await client.head(target_url)
+            content_length = head.headers.get("content-length")
+    except Exception:
+        content_length = None
+
+    headers = {}
+    if content_length:
+        headers["Content-Length"] = content_length
+
+    return StreamingResponse(
+        stream_upstream(),
+        media_type="application/octet-stream",
+        headers=headers,
+    )
