@@ -143,26 +143,70 @@ def parse_partition_table(data: bytes) -> dict:
     return result
 
 
-async def fetch_partition_info(fw_url: str) -> dict:
+async def fetch_partition_info(fw_url: str) -> tuple[dict, int]:
     """
-    Download only the partition-table region of the firmware binary (HTTP Range request)
-    and parse it.  Falls back to nb=True defaults on any error.
+    Fetch the partition-table region of the firmware binary and parse it.
+
+    Returns (partition_dict, file_size_bytes).
+    file_size comes from the Content-Length header of the 200 response
+    (0 when unknown or when a 206 partial response is used).
+
+    Strategy:
+    1. Send a Range request for bytes 0x8000..0x8000+0x1B0.
+    2. If the server honours it (206 Partial Content) – parse directly.
+    3. If the server ignores Range (200 OK) – stream the response, capture
+       Content-Length, skip the first 0x8000 bytes, read 0x1B0 bytes, stop.
+    Falls back to (nb=True defaults, 0) on any error.
     """
     byte_start = PARTITION_TABLE_OFFSET
     byte_end   = PARTITION_TABLE_OFFSET + PARTITION_TABLE_SIZE - 1
-    headers    = {"Range": f"bytes={byte_start}-{byte_end}"}
 
     try:
-        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
-            r = await client.get(fw_url, headers=headers)
-            if r.status_code not in (200, 206):
-                log.warning("Range request returned %d for %s", r.status_code, fw_url)
-                return parse_partition_table(b"")
-            log.info("Fetched %d bytes of partition table from %s", len(r.content), fw_url)
-            return parse_partition_table(r.content)
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=30) as client:
+            async with client.stream(
+                "GET", fw_url, headers={"Range": f"bytes={byte_start}-{byte_end}"}
+            ) as r:
+                if r.status_code == 206:
+                    # Extract total file size from Content-Range header, e.g.
+                    # "Content-Range: bytes 32768-33199/3582768"
+                    cr = r.headers.get("content-range", "")
+                    try:
+                        file_size = int(cr.split("/")[-1])
+                    except (ValueError, IndexError):
+                        file_size = 0
+                    data = await r.aread()
+                    log.info("Range fetch: got %d bytes, total file %d from %s",
+                             len(data), file_size, fw_url)
+                    return parse_partition_table(data), file_size
+
+                if r.status_code == 200:
+                    file_size = int(r.headers.get("content-length", 0))
+                    log.info("Server ignored Range for %s, streaming to offset 0x%x (file_size=%d)",
+                             fw_url, byte_start, file_size)
+                    collected = bytearray()
+                    skipped = 0
+                    async for chunk in r.aiter_bytes(chunk_size=8192):
+                        if skipped < byte_start:
+                            need = byte_start - skipped
+                            if len(chunk) <= need:
+                                skipped += len(chunk)
+                                continue
+                            chunk = chunk[need:]
+                            skipped = byte_start
+                        collected.extend(chunk)
+                        if len(collected) >= PARTITION_TABLE_SIZE:
+                            break
+                    data = bytes(collected[:PARTITION_TABLE_SIZE])
+                    log.info("Streamed %d bytes of partition table from %s",
+                             len(data), fw_url)
+                    return parse_partition_table(data), file_size
+
+                log.warning("Unexpected status %d for %s", r.status_code, fw_url)
+                return parse_partition_table(b""), 0
+
     except Exception as exc:
         log.warning("Failed to fetch partition table from %s: %s", fw_url, exc)
-        return parse_partition_table(b"")
+        return parse_partition_table(b""), 0
 
 
 # ---------------------------------------------------------------------------
@@ -187,22 +231,41 @@ async def get_all_sources() -> list[dict]:
 
 
 async def get_all_devices() -> set[str]:
-    """Fetch all known device names across all sources (cached in memory)."""
+    """
+    Fetch all known device names from every source (cached in memory).
+
+    The no-src /availableFirmwares endpoint only returns devices from the
+    official repository.  To also discover devices that exist exclusively in
+    third-party sources (e.g. t-deck-tft-ru in svk), we query each source
+    individually and union the results.
+    """
     global _all_devices_cache
-    if _all_devices_cache is None:
+    if _all_devices_cache is not None:
+        return _all_devices_cache
+
+    sources = await get_all_sources()
+
+    async def _fetch_for_src(src: str) -> set[str]:
         try:
             async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
-                r = await client.get(f"{UPSTREAM_BASE}/availableFirmwares")
+                r = await client.get(f"{UPSTREAM_BASE}/availableFirmwares", params={"src": src})
                 r.raise_for_status()
                 data = r.json()
-            devices: set[str] = set()
+            found: set[str] = set()
             for key in ("espdevices", "uf2devices", "rp2040devices"):
-                devices.update(data.get(key, []))
-            _all_devices_cache = devices
-            log.info("Loaded %d known device names", len(devices))
+                found.update(data.get(key, []))
+            return found
         except Exception as exc:
-            log.warning("Failed to fetch device list: %s", exc)
-            _all_devices_cache = set()
+            log.warning("Failed to fetch device list for src %r: %s", src, exc)
+            return set()
+
+    per_source = await asyncio.gather(*[_fetch_for_src(s["src"]) for s in sources])
+    devices: set[str] = set()
+    for s in per_source:
+        devices |= s
+
+    _all_devices_cache = devices
+    log.info("Loaded %d unique device names across %d sources", len(devices), len(sources))
     return _all_devices_cache
 
 
@@ -259,10 +322,22 @@ async def upstream_versions(device: str, src: str = DEFAULT_SRC) -> dict:
 
 
 def firmware_url(device: str, version: str, src: str = DEFAULT_SRC) -> str:
+    # u=1 → raw OTA binary (.bin), matching the official api.launcherhub.net format
+    # where `file` is always a direct binary link, not a ZIP archive.
+    return (
+        f"{UPSTREAM_BASE}/firmware"
+        f"?t={device}&v={version}&u=1&p=fw&e=true&src={quote(src)}"
+    )
+
+
+def firmware_zip_url(device: str, version: str, src: str = DEFAULT_SRC) -> str:
+    # u=5 → ZIP with bootloader, partitions, factory binary and littlefs.
+    # Used for the `zip_url` field (Download to SD).
     return (
         f"{UPSTREAM_BASE}/firmware"
         f"?t={device}&v={version}&u=5&p=fw&e=true&src={quote(src)}"
     )
+
 
 
 def make_fid(device: str, version: str, src: str) -> str:
@@ -420,20 +495,32 @@ async def _get_version_detail(fid: str) -> dict:
     if version not in all_versions:
         raise HTTPException(status_code=404, detail=f"Version '{version}' not found for device '{device}' in source '{src}'")
 
-    fw_url = firmware_url(device, version, src)
+    fw_url  = firmware_url(device, version, src)
+    zip_url = firmware_zip_url(device, version, src)
     log.info("Fetching partition info for %s %s [%s] from %s", device, version, src, fw_url)
-    pt = await fetch_partition_info(fw_url)
+
+    pt, file_size = await fetch_partition_info(fw_url)
+
+    # When nb=True the file IS the app binary: use the file size for `as` / `Fs`.
+    # When nb=False we have proper partition offsets; estimate Fs as ao+as when
+    # the server didn't return full file size via Content-Range.
+    app_size = pt["as"] if pt["as"] else file_size
+    if not file_size:
+        file_size = (pt["ao"] + pt["as"]) if pt["as"] else 0
 
     version_obj = {
         "version":      version,
         "published_at": dates.get(version, ""),
         "file":         fw_url,
+        "zip_url":      zip_url,
+        # File size (matches official LauncherHub `Fs` field)
+        "Fs": file_size,
         # Partition fields
         "nb": pt["nb"],
         "s":  pt["s"],
         "f":  pt["f"],
         "f2": pt["f2"],
-        "as": pt["as"],
+        "as": app_size,
         "ao": pt["ao"],
         "ss": pt["ss"],
         "so": pt["so"],
@@ -469,42 +556,65 @@ async def download_firmware(
     'file' already contains the full upstream URL built by _get_version_detail,
     so we proxy it transparently.
     """
-    target_url = file
-
-    # Fallback: reconstruct URL from fid if file param is missing
-    if not target_url and fid and "|" in fid:
+    # Always prefer to reconstruct the URL from `fid`.
+    # The `file` parameter is sent by the Launcher firmware without URL-encoding
+    # its `&` separators, so FastAPI sees only the fragment up to the first `&`
+    # (e.g. "https://…/firmware?t=t-deck-tft-ru" instead of the full URL).
+    # Reconstructing from `fid` is safe and always gives the correct URL.
+    target_url = None
+    if fid and "|" in fid:
         try:
             device, version, src = parse_fid(fid)
             target_url = firmware_url(device, version, src)
         except ValueError:
             pass
 
+    # Last resort: use whatever the `file` param contained (may be truncated)
+    if not target_url:
+        target_url = file
+
     if not target_url:
         raise HTTPException(status_code=400, detail="Provide 'file' or a valid 'fid' parameter")
 
     log.info("Proxying firmware download: %s", target_url)
 
-    async def stream_upstream():
-        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=120) as client:
-            async with client.stream("GET", target_url) as r:
-                r.raise_for_status()
-                async for chunk in r.aiter_bytes(chunk_size=8192):
-                    yield chunk
-
-    # Try to get Content-Length for progress display on the device
+    # Open the upstream connection eagerly so we can read Content-Length from
+    # the actual GET response headers before we start yielding to the client.
+    # A separate HEAD request would risk a mismatch (different redirect path,
+    # different encoding) that causes "Response content longer than Content-Length".
+    client = httpx.AsyncClient(verify=False, follow_redirects=True, timeout=120)
+    upstream = await client.send(client.build_request("GET", target_url), stream=True)
     try:
-        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
-            head = await client.head(target_url)
-            content_length = head.headers.get("content-length")
+        upstream.raise_for_status()
     except Exception:
-        content_length = None
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Upstream firmware fetch failed")
+
+    content_length = upstream.headers.get("content-length")
+
+    async def stream_body():
+        try:
+            async for chunk in upstream.aiter_bytes(chunk_size=8192):
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
 
     headers = {}
     if content_length:
         headers["Content-Length"] = content_length
+    # Suggest a meaningful filename for "Save to SD" so the device/user gets
+    # firmware-<device>-<version>.bin instead of a generic name.
+    if fid and "|" in fid:
+        try:
+            d, v, _ = parse_fid(fid)
+            headers["Content-Disposition"] = f'attachment; filename="firmware-{d}-{v}.bin"'
+        except ValueError:
+            pass
 
     return StreamingResponse(
-        stream_upstream(),
+        stream_body(),
         media_type="application/octet-stream",
         headers=headers,
     )
