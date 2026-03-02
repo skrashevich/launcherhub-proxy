@@ -31,7 +31,9 @@ For HTTPS (required by the firmware, which uses WiFiClientSecure):
 """
 
 import asyncio
+import os
 import struct
+import time
 import logging
 from typing import Optional
 from urllib.parse import quote
@@ -55,9 +57,19 @@ PARTITION_TABLE_OFFSET = 0x8000
 PARTITION_TABLE_SIZE   = 0x1B0   # a bit extra, safe margin
 
 log = logging.getLogger("launcherhub")
-logging.basicConfig(level=logging.INFO)
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 app = FastAPI(title="LauncherHub-compatible proxy")
+
+
+@app.on_event("startup")
+async def _on_startup():
+    log.info("LauncherHub proxy started — UPSTREAM=%s LOG_LEVEL=%s", UPSTREAM_BASE, _LOG_LEVEL)
 
 # In-memory caches
 _sources_cache: list[dict] | None = None
@@ -90,7 +102,8 @@ def parse_partition_table(data: bytes) -> dict:
 
     # First byte of a valid partition table magic is 0xAA
     if not data or data[0] != 0xAA:
-        log.info("No valid partition table found (first byte = 0x%02x) – treating as nb=True", data[0] if data else 0xFF)
+        log.debug("No valid partition table (first byte=0x%02x, data_len=%d) — treating as nb=True",
+                  data[0] if data else 0xFF, len(data))
         return result
 
     result["nb"] = False
@@ -117,14 +130,16 @@ def parse_partition_table(data: bytes) -> dict:
             if result["as"] == 0:          # first app partition wins
                 result["ao"] = offset
                 result["as"] = size
-            log.info("  APP  partition: offset=0x%x size=0x%x", offset, size)
+            log.debug("  APP  partition: type=0x%02x sub=0x%02x offset=0x%x size=0x%x (%d KiB)",
+                      ptype, subtype, offset, size, size // 1024)
 
         # SPIFFS / LittleFS (type=0x01, subtype=0x82 or 0x83)
         elif ptype == 0x01 and subtype in (0x82, 0x83):
             result["s"]  = True
             result["so"] = offset
             result["ss"] = size
-            log.info("  SPIFFS partition: offset=0x%x size=0x%x", offset, size)
+            log.debug("  SPIFFS partition: type=0x%02x sub=0x%02x offset=0x%x size=0x%x (%d KiB)",
+                      ptype, subtype, offset, size, size // 1024)
 
         # FAT (type=0x01, subtype=0x81)
         elif ptype == 0x01 and subtype == 0x81:
@@ -132,14 +147,20 @@ def parse_partition_table(data: bytes) -> dict:
                 result["f"]  = True
                 result["fo"] = offset
                 result["fs"] = size
-                log.info("  FAT1 partition: offset=0x%x size=0x%x", offset, size)
+                log.debug("  FAT1 partition: type=0x%02x sub=0x%02x offset=0x%x size=0x%x (%d KiB)",
+                          ptype, subtype, offset, size, size // 1024)
             elif fat_count == 1:
                 result["f2"]  = True
                 result["fo2"] = offset
                 result["fs2"] = size
-                log.info("  FAT2 partition: offset=0x%x size=0x%x", offset, size)
+                log.debug("  FAT2 partition: type=0x%02x sub=0x%02x offset=0x%x size=0x%x (%d KiB)",
+                          ptype, subtype, offset, size, size // 1024)
             fat_count += 1
+        else:
+            log.debug("  SKIP partition: type=0x%02x sub=0x%02x offset=0x%x size=0x%x",
+                      ptype, subtype, offset, size)
 
+    log.debug("Partition table result: %s", result)
     return result
 
 
@@ -161,11 +182,20 @@ async def fetch_partition_info(fw_url: str) -> tuple[dict, int]:
     byte_start = PARTITION_TABLE_OFFSET
     byte_end   = PARTITION_TABLE_OFFSET + PARTITION_TABLE_SIZE - 1
 
+    log.debug("fetch_partition_info: GET %s Range=bytes=%d-%d", fw_url, byte_start, byte_end)
+    t0 = time.monotonic()
+
     try:
         async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=30) as client:
             async with client.stream(
                 "GET", fw_url, headers={"Range": f"bytes={byte_start}-{byte_end}"}
             ) as r:
+                elapsed_headers = time.monotonic() - t0
+                log.debug("fetch_partition_info: HTTP %d (headers in %.2fs) url=%s",
+                          r.status_code, elapsed_headers, fw_url)
+                log.debug("fetch_partition_info: response headers: %s",
+                          dict(r.headers))
+
                 if r.status_code == 206:
                     # Extract total file size from Content-Range header, e.g.
                     # "Content-Range: bytes 32768-33199/3582768"
@@ -175,17 +205,20 @@ async def fetch_partition_info(fw_url: str) -> tuple[dict, int]:
                     except (ValueError, IndexError):
                         file_size = 0
                     data = await r.aread()
-                    log.info("Range fetch: got %d bytes, total file %d from %s",
-                             len(data), file_size, fw_url)
+                    elapsed = time.monotonic() - t0
+                    log.info("Partition fetch (206 Range): %d bytes read, file_size=%d in %.2fs — %s",
+                             len(data), file_size, elapsed, fw_url)
                     return parse_partition_table(data), file_size
 
                 if r.status_code == 200:
                     file_size = int(r.headers.get("content-length", 0))
-                    log.info("Server ignored Range for %s, streaming to offset 0x%x (file_size=%d)",
+                    log.info("Server ignored Range (%s) — streaming to 0x%x (content-length=%d)",
                              fw_url, byte_start, file_size)
                     collected = bytearray()
                     skipped = 0
+                    chunks_received = 0
                     async for chunk in r.aiter_bytes(chunk_size=8192):
+                        chunks_received += 1
                         if skipped < byte_start:
                             need = byte_start - skipped
                             if len(chunk) <= need:
@@ -197,15 +230,17 @@ async def fetch_partition_info(fw_url: str) -> tuple[dict, int]:
                         if len(collected) >= PARTITION_TABLE_SIZE:
                             break
                     data = bytes(collected[:PARTITION_TABLE_SIZE])
-                    log.info("Streamed %d bytes of partition table from %s",
-                             len(data), fw_url)
+                    elapsed = time.monotonic() - t0
+                    log.info("Partition fetch (200 stream): %d PT bytes from %d chunks in %.2fs — %s",
+                             len(data), chunks_received, elapsed, fw_url)
                     return parse_partition_table(data), file_size
 
-                log.warning("Unexpected status %d for %s", r.status_code, fw_url)
+                log.warning("Unexpected HTTP %d from %s", r.status_code, fw_url)
                 return parse_partition_table(b""), 0
 
     except Exception as exc:
-        log.warning("Failed to fetch partition table from %s: %s", fw_url, exc)
+        elapsed = time.monotonic() - t0
+        log.warning("fetch_partition_info failed after %.2fs for %s: %s", elapsed, fw_url, exc)
         return parse_partition_table(b""), 0
 
 
@@ -216,17 +251,24 @@ async def fetch_partition_info(fw_url: str) -> tuple[dict, int]:
 async def get_all_sources() -> list[dict]:
     """Fetch available firmware sources from upstream (cached in memory)."""
     global _sources_cache
-    if _sources_cache is None:
-        try:
-            async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
-                r = await client.get(f"{UPSTREAM_BASE}/srcs")
-                r.raise_for_status()
-                _sources_cache = r.json()
-                log.info("Loaded %d firmware sources: %s", len(_sources_cache),
-                         [s["src"] for s in _sources_cache])
-        except Exception as exc:
-            log.warning("Failed to fetch sources list: %s – falling back to default", exc)
-            _sources_cache = [{"src": DEFAULT_SRC, "desc": "Official Meshtastic firmware", "type": "meshtastic"}]
+    if _sources_cache is not None:
+        log.debug("get_all_sources: cache hit (%d sources)", len(_sources_cache))
+        return _sources_cache
+    log.debug("get_all_sources: cache miss — fetching %s/srcs", UPSTREAM_BASE)
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
+            r = await client.get(f"{UPSTREAM_BASE}/srcs")
+            r.raise_for_status()
+            _sources_cache = r.json()
+            log.info("Loaded %d firmware sources in %.2fs: %s",
+                     len(_sources_cache), time.monotonic() - t0,
+                     [s["src"] for s in _sources_cache])
+            log.debug("Sources detail: %s", _sources_cache)
+    except Exception as exc:
+        log.warning("Failed to fetch sources list (%.2fs): %s — falling back to default",
+                    time.monotonic() - t0, exc)
+        _sources_cache = [{"src": DEFAULT_SRC, "desc": "Official Meshtastic firmware", "type": "meshtastic"}]
     return _sources_cache
 
 
@@ -241,11 +283,15 @@ async def get_all_devices() -> set[str]:
     """
     global _all_devices_cache
     if _all_devices_cache is not None:
+        log.debug("get_all_devices: cache hit (%d devices)", len(_all_devices_cache))
         return _all_devices_cache
 
     sources = await get_all_sources()
+    log.debug("get_all_devices: cache miss — querying %d sources", len(sources))
+    t0 = time.monotonic()
 
     async def _fetch_for_src(src: str) -> set[str]:
+        log.debug("get_all_devices: fetching device list for src=%r", src)
         try:
             async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
                 r = await client.get(f"{UPSTREAM_BASE}/availableFirmwares", params={"src": src})
@@ -253,10 +299,13 @@ async def get_all_devices() -> set[str]:
                 data = r.json()
             found: set[str] = set()
             for key in ("espdevices", "uf2devices", "rp2040devices"):
-                found.update(data.get(key, []))
+                bucket = data.get(key, [])
+                log.debug("  src=%r key=%s devices=%d: %s", src, key, len(bucket), sorted(bucket))
+                found.update(bucket)
+            log.debug("get_all_devices: src=%r total=%d", src, len(found))
             return found
         except Exception as exc:
-            log.warning("Failed to fetch device list for src %r: %s", src, exc)
+            log.warning("Failed to fetch device list for src=%r: %s", src, exc)
             return set()
 
     per_source = await asyncio.gather(*[_fetch_for_src(s["src"]) for s in sources])
@@ -265,7 +314,9 @@ async def get_all_devices() -> set[str]:
         devices |= s
 
     _all_devices_cache = devices
-    log.info("Loaded %d unique device names across %d sources", len(devices), len(sources))
+    log.info("Loaded %d unique device names across %d sources in %.2fs",
+             len(devices), len(sources), time.monotonic() - t0)
+    log.debug("All known devices: %s", sorted(devices))
     return _all_devices_cache
 
 
@@ -283,12 +334,16 @@ def _find_family_root(category: str, all_devices: set[str]) -> str:
       "unknown-xyz" → "unknown-xyz" (no match – returned as-is)
     """
     if category in all_devices:
+        log.debug("family_root: exact match %r", category)
         return category
     parts = category.split("-")
     for n in range(len(parts) - 1, 0, -1):
         prefix = "-".join(parts[:n])
+        log.debug("family_root: trying prefix %r", prefix)
         if prefix in all_devices:
+            log.debug("family_root: %r → root %r", category, prefix)
             return prefix
+    log.debug("family_root: no known prefix for %r — using as-is", category)
     return category
 
 
@@ -307,7 +362,9 @@ def find_related_devices(category: str, all_devices: set[str]) -> list[str]:
     for device in all_devices:
         if device == root or device.startswith(root + "-") or device.startswith(root + "_"):
             related.add(device)
-    return [category] + sorted(d for d in related if d != category)
+    result = [category] + sorted(d for d in related if d != category)
+    log.debug("find_related_devices: %r → root=%r → %s", category, root, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -315,10 +372,17 @@ def find_related_devices(category: str, all_devices: set[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 async def upstream_versions(device: str, src: str = DEFAULT_SRC) -> dict:
+    url = f"{UPSTREAM_BASE}/versions"
+    log.debug("upstream_versions: GET %s t=%r src=%r", url, device, src)
+    t0 = time.monotonic()
     async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=15) as client:
-        r = await client.get(f"{UPSTREAM_BASE}/versions", params={"t": device, "src": src})
+        r = await client.get(url, params={"t": device, "src": src})
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+    versions = data.get("versions", [])
+    log.debug("upstream_versions: t=%r src=%r → %d versions in %.2fs: %s",
+              device, src, len(versions), time.monotonic() - t0, versions)
+    return data
 
 
 def firmware_url(device: str, version: str, src: str = DEFAULT_SRC) -> str:
@@ -372,20 +436,25 @@ async def _fetch_all_versions(
         for device in device_variants
         for source in sources
     ]
+    log.debug("_fetch_all_versions: %d combinations (%s × %s)",
+              len(combinations), device_variants, [s["src"] for s in sources])
+    t0 = time.monotonic()
 
     async def fetch_one(device: str, src: str):
         try:
             data = await upstream_versions(device, src)
+            n = len(data.get("versions", []))
+            log.debug("  fetch_one: device=%r src=%r → %d versions", device, src, n)
             return (device, src, data)
         except Exception as exc:
-            log.debug("No versions for %s from %s: %s", device, src, exc)
+            log.debug("  fetch_one: device=%r src=%r → no data (%s)", device, src, exc)
             return None
 
     results = await asyncio.gather(*[fetch_one(d, s) for d, s in combinations])
-    return [
-        r for r in results
-        if r is not None and r[2].get("versions")
-    ]
+    found = [r for r in results if r is not None and r[2].get("versions")]
+    log.debug("_fetch_all_versions: %d/%d combinations have results in %.2fs",
+              len(found), len(combinations), time.monotonic() - t0)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +470,9 @@ async def get_firmwares(
     q:         Optional[str] = Query(None),
     star:      Optional[int] = Query(None),
 ):
+    log.debug("GET /firmwares fid=%r category=%r order_by=%r page=%d q=%r star=%r",
+              fid, category, order_by, page, q, star)
+
     # ---- Mode 1: detail for a single firmware ----
     if fid:
         return await _get_version_detail(fid)
@@ -452,6 +524,8 @@ async def get_firmwares(
     total = len(items)
     start = (page - 1) * PAGE_SIZE
     page_items = items[start: start + PAGE_SIZE]
+    log.debug("GET /firmwares category=%r: total=%d page=%d/%d items_on_page=%d",
+              category, total, page, -(-total // PAGE_SIZE) or 1, len(page_items))
 
     result_items = [
         {"fid": i["fid"], "name": i["name"], "author": i["author"], "star": i["star"]}
@@ -497,9 +571,14 @@ async def _get_version_detail(fid: str) -> dict:
 
     fw_url  = firmware_url(device, version, src)
     zip_url = firmware_zip_url(device, version, src)
-    log.info("Fetching partition info for %s %s [%s] from %s", device, version, src, fw_url)
+    log.info("Fetching partition info for %s %s [%s]", device, version, src)
+    log.debug("  fw_url=%s", fw_url)
+    log.debug("  zip_url=%s", zip_url)
 
+    t0 = time.monotonic()
     pt, file_size = await fetch_partition_info(fw_url)
+    log.debug("fetch_partition_info done in %.2fs: pt=%s file_size=%d",
+              time.monotonic() - t0, pt, file_size)
 
     # When nb=True the file IS the app binary: use the file size for `as` / `Fs`.
     # When nb=False we have proper partition offsets; estimate Fs as ao+as when
@@ -507,6 +586,8 @@ async def _get_version_detail(fid: str) -> dict:
     app_size = pt["as"] if pt["as"] else file_size
     if not file_size:
         file_size = (pt["ao"] + pt["as"]) if pt["as"] else 0
+    log.debug("_get_version_detail: app_size=%d file_size=%d nb=%s s=%s f=%s f2=%s",
+              app_size, file_size, pt["nb"], pt["s"], pt["f"], pt["f2"])
 
     version_obj = {
         "version":      version,
@@ -556,6 +637,8 @@ async def download_firmware(
     'file' already contains the full upstream URL built by _get_version_detail,
     so we proxy it transparently.
     """
+    log.debug("GET /download fid=%r file=%r", fid, file)
+
     # Always prefer to reconstruct the URL from `fid`.
     # The `file` parameter is sent by the Launcher firmware without URL-encoding
     # its `&` separators, so FastAPI sees only the fragment up to the first `&`
@@ -566,12 +649,14 @@ async def download_firmware(
         try:
             device, version, src = parse_fid(fid)
             target_url = firmware_url(device, version, src)
-        except ValueError:
-            pass
+            log.debug("/download: URL reconstructed from fid=%r → %s", fid, target_url)
+        except ValueError as exc:
+            log.warning("/download: failed to parse fid=%r: %s", fid, exc)
 
     # Last resort: use whatever the `file` param contained (may be truncated)
     if not target_url:
         target_url = file
+        log.debug("/download: using raw `file` param (may be truncated): %s", target_url)
 
     if not target_url:
         raise HTTPException(status_code=400, detail="Provide 'file' or a valid 'fid' parameter")
@@ -592,6 +677,8 @@ async def download_firmware(
         raise HTTPException(status_code=502, detail="Upstream firmware fetch failed")
 
     content_length = upstream.headers.get("content-length")
+    log.debug("/download upstream HTTP %d content-length=%s headers=%s",
+              upstream.status_code, content_length, dict(upstream.headers))
 
     async def stream_body():
         try:
